@@ -1,0 +1,16 @@
+services:
+  api:
+    build: .
+    ports:
+      - "8020:8000"
+    volumes:
+      - ./data:/app/data
+
+  ui:
+    build:
+      context: .
+      dockerfile: Dockerfile.ui
+    ports:
+      - "8521:8501"
+    volumes:
+      - ./data:/app/data
