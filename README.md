@@ -1,4 +1,4 @@
-# DemandCast — Production Retail Demand Forecasting Engine
+# DemandCast — Multi-Horizon Retail Demand Forecasting (Transformer Chain Architecture)
 
 <div align="center">
 
@@ -13,67 +13,83 @@
 
 </div>
 
-> **Hierarchical, multi-horizon demand forecasting engine built on Walmart M5 retail data featuring rolling-origin backtesting, probabilistic LightGBM forecasts, and automated safety stock planning.**
+> **Multi-horizon retail demand forecasting engine utilizing a Scikit-Learn compatible Transformer Chain Architecture to enforce temporal causality, non-leaking lag computation, probabilistic quantile fan charts, and dynamic safety stock optimization.**
 
 ---
 
-## 📖 Executive Summary & Value Proposition
+## 🏛️ Architecture Pattern: Transformer Chain Architecture (Fit/Transform Contract)
 
-**`demandcast`** is a production-grade, end-to-end machine learning system built with strict engineering discipline, reproducible pipelines, and enterprise MLOps best practices. It bridges the gap between theoretical statistical rigor and high-availability operational microservices.
+In multi-horizon time-series forecasting, data leakage across historical and future horizons is the primary cause of production model degradation. Procedural feature engineering pipelines often mistakenly compute rolling statistics over test horizons.
 
-## 📈 Core Methodologies & Time Series Engineering
-
-### 1. Feature Store & Temporal Signal Processing
-- Multi-lag autoregressive features ($t-1, t-7, t-14, t-28, t-365$).
-- Rolling window statistics (mean, std, min, max, skew over 7, 14, 28, and 90-day windows).
-- Calendar, seasonality, SNAP food assistance event flags, and price elasticity ratios.
-
-### 2. Rolling-Origin Backtesting & Benchmark Suite
-- Expanding-window evaluation simulating realistic production retraining schedules without data leakage.
-- Direct comparison against classical statistical baselines (AutoARIMA, Exponential Smoothing, Seasonal Naive) showing >20% WAPE reduction.
-
-### 3. Probabilistic Forecasts & Safety Stock Calculus
-- P10, P50, and P90 quantile loss optimization.
-- Computes dynamic safety stock and reorder points based on forecast uncertainty and targeted service levels (e.g. 95% or 99% fill rate):
-$$	ext{Safety Stock} = z_lpha \cdot \sqrt{L \cdot \sigma_D^2 + D^2 \cdot \sigma_L^2}$$
-
-## 📊 Architecture & Pipeline
+`demandcast` enforces strict temporal isolation via a **Transformer Chain** where each step implements the `fit(X, y)` and `transform(X)` contract:
 
 ```mermaid
-flowchart LR
-    Raw[M5 Walmart Dataset] --> Feat[Lag & Rolling Feature Store]
-    Feat --> Backtest[Rolling-Origin Backtesting Engine]
-    Backtest --> LGBM[Probabilistic LightGBM<br/>P10, P50, P90]
-    LGBM --> Stock[Safety Stock & Reorder Planner]
-    Stock --> API[FastAPI :8060] --> UI[Streamlit Demand Dashboard :8561]
+graph LR
+    subgraph Data_Input ["Input Time Series"]
+        Raw[Raw Sales Data<br/>unique_id, ds, y]
+    end
+
+    subgraph Transformer_Chain ["Composable TransformerChain"]
+        Cal[CalendarFeatureTransformer<br/>dayofweek, month, is_weekend]
+        Lag[LagFeatureTransformer<br/>Strict Non-Leaking Shifts t-7, t-14, t-28]
+        Roll[RollingStatTransformer<br/>Shifted-First Rolling Mean & Std]
+        Clip[OutlierClipperTransformer<br/>Fitted IQR Quantile Bounds]
+    end
+
+    subgraph Estimator_Layer ["Probabilistic Estimator & Inventory Policy"]
+        LGBM[LightGBM Quantile Regressors<br/>P10, P50, P90 Quantile Fans]
+        Stock[Dynamic Safety Stock Optimizer<br/>Z-Score Fill Rate Target]
+    end
+
+    Raw --> Cal
+    Cal --> Lag
+    Lag --> Roll
+    Roll --> Clip
+    Clip --> LGBM
+    LGBM --> Stock
 ```
 
-## 🛠️ Tech Stack & Engineering Standards
-- **Forecasting:** Python 3.12, StatsForecast, MLForecast, LightGBM, UtilsForecast, PyArrow
-- **Serving & UI:** FastAPI, Streamlit, MLflow
-- **Testing:** Pytest coverage across feature generation, backtesting loops, and inventory metrics
+### Module Organization
+- **`pipeline/base.py`**: Formal `TransformerStep` protocol with `fit`, `transform`, and `fit_transform` signatures.
+- **`pipeline/transformers.py`**:
+  - `CalendarFeatureTransformer`: Pure calendar signal extractor.
+  - `LagFeatureTransformer`: Enforces that lag $t-k$ strictly uses historical data prior to time $t$.
+  - `RollingStatTransformer`: Implements `shift(1)` before window operations to eliminate lookahead bias.
+  - `OutlierClipperTransformer`: Learns per-series quantile boundaries during `fit` and clips inference spikes.
+- **`pipeline/chain.py`**: Composable `TransformerChain` executing multi-step transforms deterministically across backtests and serving.
 
+---
+
+## 📈 Core Methodologies & Time Series Formulations
+
+### 1. Rolling-Origin Backtesting
+- Expanding-window evaluation simulating realistic production retraining schedules without data leakage.
+- Direct comparison against classical statistical baselines (AutoARIMA, Exponential Smoothing, Seasonal Naive) achieving $>20\%$ WAPE reduction.
+
+### 2. Probabilistic Forecasts & Safety Stock Optimization
+- Quantile loss optimization yielding prediction intervals $[P_{10}, P_{50}, P_{90}]$.
+- Computes dynamic safety stock and reorder points based on forecast uncertainty and service level targets:
+  $$\text{Safety Stock} = z_\alpha \cdot \sqrt{L \cdot \sigma_D^2 + D^2 \cdot \sigma_L^2}$$
 
 ---
 
 ## 🚀 Quickstart & Setup Guide
 
 ### 1. Prerequisites & Environment Setup
-Using **[uv](https://docs.astral.sh/uv/)** for lightning-fast, reproducible dependency resolution:
-
 ```bash
-# Clone the repository
+# Clone repository
 git clone https://github.com/jackson-marcus/demandcast.git
 cd demandcast
 
-# Install dependencies and pre-commit hooks
+# Install dependencies via uv
+$env:UV_CACHE_DIR = "D:\ml-projects\.uv-cache"
 uv sync --group dev
 ```
 
 ### 2. Run Test Suite & Code Quality Checks
 ```bash
-# Run unit & integration tests with coverage
-uv run pytest --cov
+# Run unit & transformer chain tests
+uv run pytest -q
 
 # Run ruff linter and formatting checks
 uv run ruff check .
@@ -84,19 +100,9 @@ uv run ruff format --check .
 ```bash
 # Start FastAPI REST API (listening on port :8060)
 make api
-# Or: uv run uvicorn demandcast.api.main:app --reload --port 8060
 
 # Start interactive Streamlit dashboard (listening on port :8561)
 make ui
-
-# Launch local MLflow Experiment Tracking UI (listening on port :5006)
-make mlflow
-```
-
-### 4. Run with Docker Compose
-```bash
-# Spin up the complete microservice stack
-docker compose up --build
 ```
 
 ---
@@ -105,19 +111,18 @@ docker compose up --build
 
 ```
 demandcast/
-├── .github/workflows/ci.yml       # GitHub Actions CI pipeline (lint, test, build)
-├── configs/                      # Configuration files and hyperparameters
-├── data/                         # Data directory (raw, interim, processed)
-├── scripts/                      # Data generators and operational scripts
+├── configs/                      # Configuration files and hyperparameter specs
+├── data/                         # M5 Walmart sales dataset and cache
 ├── src/demandcast/               # Core Python package
-│   ├── api/                      # FastAPI routes, schemas, and endpoints
-│   ├── models/                   # Statistical models, ML algorithms, and estimators
-│   ├── ui/                       # Streamlit interactive application
-│   └── settings.py               # Centralized configuration & environment loader
-├── tests/                        # Comprehensive Pytest suite
+│   ├── pipeline/                 # Composable Transformer Chain Architecture
+│   ├── features/                 # Feature store adapter layer
+│   ├── models/                   # Rolling backtester and LightGBM forecasters
+│   ├── evaluation/               # WAPE, MASE, and pinball loss metrics
+│   ├── api/                      # FastAPI prediction and metadata endpoints
+│   └── ui/                       # Streamlit forecasting workspace
+├── tests/                        # Unit tests for transformer chains and backtests
 ├── docker-compose.yml            # Multi-service container orchestration
 ├── Dockerfile                    # Container definition for API service
-├── Makefile                      # Standardized project tasks
 └── pyproject.toml                # Pinned dependencies and tool configs
 ```
 
@@ -130,5 +135,20 @@ demandcast/
 - **Upwork:** [Jackson Marcus on Upwork](https://www.upwork.com/freelancers/~012235717501ad9c7b)
 - **GitHub:** [@jackson-marcus](https://github.com/jackson-marcus)
 
-*Available for machine learning engineering, MLOps, data science, and AI system architecture consulting and contract engagements.*
+---
 
+## 👨‍💻 Author & Maintainer
+
+<div align="center">
+
+### **Jackson Marcus**
+**Senior AI & Machine Learning Engineer**
+*Building Production-Grade ML Systems, Agentic Architectures & Scalable Data Pipelines*
+
+[![GitHub Profile](https://img.shields.io/badge/GitHub-jackson--marcus-181717?style=for-the-badge&logo=github&logoColor=white)](https://github.com/jackson-marcus)
+[![Upwork Portfolio](https://img.shields.io/badge/Upwork-Top%20Rated%20Plus-14A800?style=for-the-badge&logo=upwork&logoColor=white)](https://www.upwork.com/freelancers/~012235717501ad9c7b)
+[![Email Contact](https://img.shields.io/badge/Email-wajahatanees41%40gmail.com-D14836?style=for-the-badge&logo=gmail&logoColor=white)](mailto:wajahatanees41@gmail.com)
+
+📍 *Byron, GA, USA*
+
+</div>
