@@ -6,7 +6,8 @@
 data/raw/
 data/interim/
 data/processed/
-models/
+/models/
+!src/demandcast/models/
 mlruns/
 mlflow.db
 *.parquet
