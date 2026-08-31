@@ -17,8 +17,6 @@
 
 </div>
 
-> **Portfolio project.** Built to demonstrate leak-free time-series feature engineering, probabilistic forecasting, and rolling-origin evaluation on realistic (synthetic) retail data. Runs on a CPU-sized data subset and is not hardened for production.
-
 ---
 
 ## The problem
@@ -121,6 +119,59 @@ $$L_q(y, \hat{y}) = \max\big(q\,(y - \hat{y}),\ (q - 1)(y - \hat{y})\big)$$
 
 - **Interval coverage** — the empirical fraction of actuals falling inside the P10–P90 band (well-calibrated ≈ 0.8).
 
+## From a forecast to an order quantity
+
+A daily quantile fan is not a replenishment decision. Turning one into the other
+is where forecasting systems lose money, because the arithmetic that looks
+obvious is wrong in a specific and expensive way.
+
+`/replenish` runs the pipeline that does it: `leadtime` aggregates the daily fan
+over the lead time, `calibrate` conformalises the band, `position` converts it to
+an order-up-to level, `policy` emits the order, and `audit` decides whether the
+series is fit to be ordered against at all.
+
+### Summing daily P90s is not a P90
+
+Ask a planner to cover a 7-day lead time at 90% and the natural move is to add
+up seven daily P90s. That quantity is only correct if the seven days are
+*perfectly correlated* — one bad day implying all seven are bad. Real demand is
+nothing like that, so the sum lands far above the quantile it claims to be.
+
+Replaying the same base-stock simulator over 80 series at a 7-day lead time and
+a 90% fill target:
+
+```
+       policy     fill  mean on-hand  stockout d  below target
+ quantile_sum   0.9969         37.27          21             0
+ variance_sum   0.9595         19.51         176            11
+      floored   0.9676         21.57         142             8
+
+quantile_sum holds +91.0% inventory vs variance_sum, +72.8% vs floored
+```
+
+`quantile_sum` does hit the best fill — it is not *broken*, it is
+over-conservative — but it buys roughly four points of fill with **91% more
+stock on hand**. `variance_sum` adds the daily sigmas in quadrature instead,
+which is the independent-demand assumption and undershoots on the spikier
+series. `floored` is what `/replenish` actually uses: quadrature, with each
+day's sigma floored at that series' own seasonal-naive residual volatility, so a
+series the model happens to fit tightly in-sample cannot talk itself into a
+thin band.
+
+### The band is not as good as it claims
+
+Reported rather than buried: the P10–P90 interval covers **70.7%** of held-out
+actuals against a nominal 80%, and 2 of 2,240 forecast rows come back with
+crossed quantiles. That is why `calibrate` exists, and why `audit` gates the
+series — it flagged 2 of the 80 live series as unfit to order against without
+review.
+
+Reproduce with:
+
+```bash
+uv run python scripts/leadtime_study.py
+```
+
 ## Getting started
 
 ```bash
@@ -158,6 +209,7 @@ The service reads precomputed forecasts from `data/forecasts/latest.parquet`; ru
 | `GET` | `/health` | Liveness check |
 | `GET` | `/series` | List all available series ids (`ITEM_xxx/ST_x`) |
 | `GET` | `/forecast?unique_id=<id>&h=28` | Forecast points for one series: `yhat` plus `q10` / `q50` / `q90`, up to 28 steps |
+| `GET` | `/replenish?unique_id=<id>&lead_time=7` | Order-up-to level and order quantity for one series, with the audit verdict that gates it |
 
 ## Evaluation
 
@@ -180,9 +232,14 @@ make test        # pytest --cov
 - `test_backtest.py` — rolling cutoffs and baseline forecaster shape
 - `test_metrics.py` — MASE / RMSSE / pinball / coverage
 - `test_prepare.py` — data preparation and schema validation
+- `test_replenishment.py` — the aggregation rules (that summing daily P90s exceeds the quadrature level, and that the volatility floor only ever widens a band), base-stock fill monotone in the order-up-to level, service non-increasing in lead time, and the audit gate refusing a series rather than ordering against it
 - `test_api.py` — HTTP contract tests
 
 ## Limitations
+
+- The quadrature aggregation assumes daily forecast errors are independent. They are not - promotions and weather correlate them - so the true lead-time quantile sits somewhere between `variance_sum` and `quantile_sum`, and the volatility floor is a blunt way of buying back that gap rather than a model of it.
+- The base-stock replay is a simulation on held-out history with a fixed lead time and no supplier variability, minimum order quantity, or shelf life. It ranks the aggregation rules against each other; it does not predict a real fill rate.
+- Measured band coverage is 70.7% against a nominal 80%. Conformal calibration narrows that gap on the series it has residuals for, but a new series starts uncalibrated.
 
 - **Forecasts are precomputed, not live.** The API serves a stored parquet; a new series or a data change requires re-running `make refresh`.
 - **CPU-sized by design.** The default config keeps only a couple of stores and the top items (`data.stores`, `top_items`) so it runs on a laptop; real deployments would need to scale the training step.

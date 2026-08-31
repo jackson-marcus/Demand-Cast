@@ -1,7 +1,11 @@
-"""API routes: /forecast, /series, /health.
+"""API routes: /forecast, /replenish, /series, /health.
 
 Forecasts are precomputed by scripts/refresh_forecasts.py (training on-the-fly
 per request would be neither fast nor reproducible) and served from parquet.
+
+/forecast hands back the fan. /replenish answers the question the fan exists
+for -- how many units to order today -- by running the staged plan in
+demandcast.pipeline over the same parquet plus the realised sales panel.
 """
 
 from __future__ import annotations
@@ -13,6 +17,9 @@ import pandas as pd
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 
+from demandcast.models.backtest import load_sales
+from demandcast.pipeline.executor import ReplenishmentPlanner, ReplenishmentRequest
+from demandcast.pipeline.steps.fan import HorizonTooShortError, SeriesUnavailableError
 from demandcast.settings import get_config, resolve_path
 
 logger = logging.getLogger(__name__)
@@ -42,8 +49,14 @@ def _forecasts() -> pd.DataFrame:
     return pd.read_parquet(path)
 
 
+@functools.lru_cache(maxsize=1)
+def _history() -> pd.DataFrame:
+    return load_sales()
+
+
 def invalidate_cache() -> None:
     _forecasts.cache_clear()
+    _history.cache_clear()
 
 
 @router.get("/health")
@@ -88,4 +101,98 @@ def forecast(
         model=str(part["model"].iloc[0]) if "model" in part.columns else "unknown",
         horizon=len(points),
         points=points,
+    )
+
+
+class SpreadInfo(BaseModel):
+    sigma_daily_mean: float
+    sigma_floor: float
+    days_floored: int
+    crossed_days_repaired: int
+
+
+class AuditInfo(BaseModel):
+    window_days: int
+    fill_rate: float
+    target_fill_rate: float
+    stockout_days: int
+    unmet_units: float
+    mean_on_hand: float
+    meets_target: bool
+
+
+class ReplenishmentResponse(BaseModel):
+    unique_id: str
+    status: str
+    order_quantity: float
+    order_up_to: float
+    inventory_position: float
+    protection_days: int
+    expected_demand: float
+    safety_stock: float
+    comonotone_order_up_to: float
+    comonotone_extra_units: float
+    spread: SpreadInfo
+    audit: AuditInfo
+    stages: list[str]
+
+
+@router.get("/replenish", response_model=ReplenishmentResponse)
+def replenish(
+    unique_id: str = Query(..., description="e.g. ITEM_001/ST_1"),
+    on_hand: float = Query(default=0.0, ge=0, description="units physically in stock"),
+    in_transit: float = Query(default=0.0, ge=0, description="units already ordered"),
+    lead_time: int = Query(default=7, ge=0, le=27, description="supplier lead time in days"),
+    service_level: float = Query(default=0.9, ge=0.5, lt=1.0),
+) -> ReplenishmentResponse:
+    """How many units to order today, and whether that level survives an audit."""
+    try:
+        planner = ReplenishmentPlanner(_forecasts(), _history())
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    request = ReplenishmentRequest(
+        unique_id=unique_id,
+        on_hand=on_hand,
+        in_transit=in_transit,
+        lead_time=lead_time,
+        service_level=service_level,
+    )
+    try:
+        result = planner.run(request)
+    except SeriesUnavailableError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except HorizonTooShortError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    order, spread, audit = result["order"], result["spread"], result["audit"]
+    return ReplenishmentResponse(
+        unique_id=unique_id,
+        status=result["status"],
+        order_quantity=round(order["order_quantity"], 2),
+        order_up_to=round(order["order_up_to"], 2),
+        inventory_position=result["position"]["inventory_position"],
+        protection_days=result["leadtime"]["days"],
+        expected_demand=round(result["leadtime"]["expected_demand"], 2),
+        safety_stock=round(order["safety_stock"], 2),
+        comonotone_order_up_to=round(order["comonotone_order_up_to"], 2),
+        comonotone_extra_units=round(order["comonotone_extra_units"], 2),
+        spread=SpreadInfo(
+            sigma_daily_mean=round(float(spread["sigma_daily"].mean()), 3),
+            sigma_floor=round(spread["sigma_floor"], 3),
+            days_floored=spread["days_floored"],
+            crossed_days_repaired=result["fan"]["crossed_days_repaired"],
+        ),
+        audit=AuditInfo(
+            window_days=audit["window_days"],
+            fill_rate=round(audit["fill_rate"], 4),
+            target_fill_rate=audit["target_fill_rate"],
+            stockout_days=audit["stockout_days"],
+            unmet_units=round(audit["unmet_units"], 2),
+            mean_on_hand=round(audit["mean_on_hand"], 2),
+            meets_target=audit["meets_target"],
+        ),
+        stages=result["stages"],
     )

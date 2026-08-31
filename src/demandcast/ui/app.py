@@ -28,7 +28,9 @@ def _forecasts() -> pd.DataFrame | None:
 sales = _sales()
 forecasts = _forecasts()
 
-tab_forecast, tab_monitor = st.tabs(["Forecast explorer", "Accuracy monitor"])
+tab_forecast, tab_order, tab_monitor = st.tabs(
+    ["Forecast explorer", "Replenishment", "Accuracy monitor"]
+)
 
 with tab_forecast:
     uid = st.selectbox("Series", sorted(sales["unique_id"].unique()))
@@ -90,3 +92,65 @@ with tab_monitor:
                 st.error("🚨 Forecast accuracy degraded — retrain or investigate demand shift.")
             else:
                 st.success("✅ Forecast accuracy within tolerance.")
+
+with tab_order:
+    st.markdown(
+        "Turns the stored fan into an order-up-to level for one series, then replays "
+        "that level against the demand the series actually saw before recommending it."
+    )
+    if forecasts is None:
+        st.info("No stored forecasts - run scripts/refresh_forecasts.py")
+    else:
+        from demandcast.pipeline.executor import ReplenishmentPlanner, ReplenishmentRequest
+        from demandcast.pipeline.steps.fan import HorizonTooShortError, SeriesUnavailableError
+
+        c1, c2, c3, c4 = st.columns(4)
+        order_uid = c1.selectbox("Series ", sorted(forecasts["unique_id"].unique()), key="ord_uid")
+        lead_time = c2.number_input("Supplier lead time (days)", 0, 27, 7)
+        service_level = c3.slider("Target fill rate", 0.50, 0.99, 0.90, 0.01)
+        on_hand = c4.number_input("On hand (units)", 0.0, value=0.0, step=1.0)
+
+        planner = ReplenishmentPlanner(forecasts, sales)
+        try:
+            plan = planner.run(
+                ReplenishmentRequest(
+                    unique_id=order_uid,
+                    on_hand=on_hand,
+                    lead_time=int(lead_time),
+                    service_level=float(service_level),
+                )
+            )
+        except (SeriesUnavailableError, HorizonTooShortError, ValueError) as exc:
+            st.error(str(exc))
+        else:
+            order, audit, lt = plan["order"], plan["audit"], plan["leadtime"]
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Order now", f"{order['order_quantity']:.0f} units")
+            m2.metric("Order up to", f"{order['order_up_to']:.1f}")
+            m3.metric(f"Expected demand ({lt['days']}d)", f"{lt['expected_demand']:.1f}")
+            m4.metric("Safety stock", f"{order['safety_stock']:.1f}")
+
+            if plan["status"] == "review":
+                st.warning(
+                    f"Needs review: replayed against the last {audit['window_days']} days of "
+                    f"actual demand this level fills {audit['fill_rate']:.1%}, short of the "
+                    f"{service_level:.0%} target ({audit['unmet_units']:.0f} units unmet, "
+                    f"{audit['stockout_days']} stockout days)."
+                )
+            elif plan["status"] == "hold":
+                st.success("Hold - the current position already covers the order-up-to level.")
+            else:
+                st.success(
+                    f"Audited fill {audit['fill_rate']:.1%} over the last "
+                    f"{audit['window_days']} days of actual demand, mean on-hand "
+                    f"{audit['mean_on_hand']:.1f} units."
+                )
+
+            st.caption(
+                f"Summing the daily P90 instead of adding variances would set the level at "
+                f"{order['comonotone_order_up_to']:.1f} - "
+                f"{order['comonotone_extra_units']:.1f} extra units carried. "
+                f"Spread floored on {plan['spread']['days_floored']} of {lt['days']} days; "
+                f"{plan['fan']['crossed_days_repaired']} crossed quantile day(s) repaired. "
+                f"Stages: {' -> '.join(plan['stages'])}."
+            )
